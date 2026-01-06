@@ -8,6 +8,7 @@ A lightweight image-processing pipeline design tool built with **PyQt5 + OpenCV*
 
 #### 1. Image Preview
 
+- **Original**: the original image
 - **Before**: the current committed image in the pipeline
 - **After**: live preview of the selected operation applied to the current image
 
@@ -23,10 +24,12 @@ Supported operations:
 - Threshold (non-adaptive)
 - Adaptive Threshold
 - Otsu Threshold
-- Sobel (X/Y/Magnitude)
+- Sobel
 - Canny
-- Morphology (Erode, Dilate, Open, Close, Gradient, TopHat, BlackHat)
+- Morphology
 - Difference (with a user-selected second image)
+- Connected Component Area Filter
+- Connected Component Clustering
 - CLAHE
 - Unsharp Mask
 - Gamma Correction
@@ -35,7 +38,9 @@ Supported operations:
 
 - **Apply Step**: commit the current preview as a pipeline stage
 - **Undo / Redo**: navigate pipeline history
+- **Save Result**: save result image
 - **Reset**: return to the original image
+- **Apply Pipeline to New Image**: apply current pipeline to a new image
 
 #### 4. History Log
 

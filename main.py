@@ -1,7 +1,7 @@
 import sys
 import os
 from dataclasses import dataclass
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 
 import numpy as np
 import cv2
@@ -24,15 +24,17 @@ from PyQt5.QtWidgets import (
     QComboBox,
     QSlider,
     QCheckBox,
+    QSpinBox,
     QFrame,
     QSizePolicy,
     QStackedWidget,
 )
 
-
 # ----------------------------
 # Utilities: image <-> QImage
 # ----------------------------
+
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp")
 
 
 def cv_to_qimage(img: np.ndarray) -> QImage:
@@ -95,14 +97,50 @@ def read_image_any_path(path: str) -> Optional[np.ndarray]:
             return img
     except Exception:
         pass
-    img = cv2.imread(path, cv2.IMREAD_COLOR)
-    return img
+    return cv2.imread(path, cv2.IMREAD_COLOR)
+
+
+def write_image_any_path(path: str, bgr: np.ndarray) -> None:
+    """Robust write for unicode paths on Windows/Linux using imencode+tofile."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext == "":
+        path += ".png"
+        ext = ".png"
+
+    ext_map = {
+        ".png": ".png",
+        ".jpg": ".jpg",
+        ".jpeg": ".jpg",
+        ".bmp": ".bmp",
+        ".tif": ".tif",
+        ".tiff": ".tif",
+        ".webp": ".webp",
+    }
+    if ext not in ext_map:
+        raise ValueError("Unsupported file extension.")
+
+    ok, buf = cv2.imencode(ext_map[ext], bgr)
+    if not ok:
+        raise RuntimeError("Failed to encode image.")
+    buf.tofile(path)
 
 
 def resize_to_match(src_bgr: np.ndarray, target_bgr: np.ndarray) -> np.ndarray:
     """Resize src to exactly match target shape (H, W)."""
     th, tw = target_bgr.shape[:2]
     return cv2.resize(src_bgr, (tw, th), interpolation=cv2.INTER_LINEAR)
+
+
+def list_images_in_dir(folder: str) -> List[str]:
+    if not folder or not os.path.isdir(folder):
+        return []
+    files = []
+    for name in os.listdir(folder):
+        p = os.path.join(folder, name)
+        if os.path.isfile(p) and name.lower().endswith(IMAGE_EXTS):
+            files.append(p)
+    files.sort(key=lambda s: os.path.basename(s).lower())
+    return files
 
 
 # ----------------------------
@@ -339,16 +377,12 @@ class Processor:
     def absdiff(
         img: np.ndarray, ref_img: np.ndarray, use_abs: bool, normalize: bool
     ) -> OperationResult:
-        base = img
-        ref = ref_img
-
         if use_abs:
-            out = cv2.absdiff(base, ref)
+            out = cv2.absdiff(img, ref_img)
         else:
-            out = cv2.subtract(base, ref)  # saturating subtract
+            out = cv2.subtract(img, ref_img)  # saturating subtract
 
         if normalize:
-            # Normalize per channel to 0..255 for better visibility
             out_f = out.astype(np.float32)
             out_n = np.zeros_like(out_f)
             for c in range(3):
@@ -365,6 +399,218 @@ class Processor:
         )
 
     @staticmethod
+    def cc_area_filter(
+        img: np.ndarray,
+        area_thresh_px: int,
+        mode: str,
+        invert_input: bool,
+        ignore_border: bool,
+        connectivity: int,
+    ) -> OperationResult:
+        """
+        Connected-component filter using **pixel area** threshold.
+
+        - mode: "Remove Larger Than" or "Remove Smaller Than"
+        - invert_input: invert the binary before processing (if your foreground is black)
+        - ignore_border: ignore components that touch the image border
+        - connectivity: 4 or 8
+        Notes:
+          This operation binarizes the image via Otsu internally. If your input is already binary,
+          Otsu typically preserves it.
+        """
+        if img is None:
+            raise ValueError("No image.")
+
+        gray = ensure_gray(img)
+
+        # Otsu binarization: foreground tends to be white for typical masks
+        _, bin_img = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+
+        if invert_input:
+            bin_img = 255 - bin_img
+
+        h, w = bin_img.shape[:2]
+        total_px = int(h * w)
+        if total_px <= 0:
+            return OperationResult(ensure_bgr(bin_img), "CC Area Filter (empty image)")
+
+        # Analyze black components inside the white foreground:
+        # Invert so black regions become white for CC analysis
+        inv = 255 - bin_img
+
+        n, labels, stats, _ = cv2.connectedComponentsWithStats(
+            inv, connectivity=connectivity
+        )
+        areas = stats[:, cv2.CC_STAT_AREA].astype(np.int64)
+
+        # Border-touching components (usually the outside background in this inverted view)
+        border_touch = [False] * n
+        if ignore_border and n > 1:
+            top = labels[0, :]
+            bot = labels[h - 1, :]
+            left = labels[:, 0]
+            right = labels[:, w - 1]
+            touched = np.unique(
+                np.concatenate([top, bot, left, right]).astype(np.int32)
+            )
+            for idx in touched.tolist():
+                if 0 <= idx < n:
+                    border_touch[idx] = True
+
+        out_bin = bin_img.copy()
+        thr = int(max(0, min(int(area_thresh_px), total_px)))
+        remove_larger = mode == "Remove Larger Than"
+
+        for i in range(1, n):
+            if ignore_border and border_touch[i]:
+                continue
+
+            area_i = int(areas[i])
+            cond = (area_i > thr) if remove_larger else (area_i < thr)
+
+            if cond:
+                # Removing a black component means "filling it" -> set to white in original bin
+                out_bin[labels == i] = 255
+
+        if invert_input:
+            out_bin = 255 - out_bin
+
+        return OperationResult(
+            ensure_bgr(out_bin),
+            f"CC Area Filter (mode={mode}, thr={thr}px, conn={connectivity}, invert={invert_input}, ignore_border={ignore_border})",
+        )
+
+    @staticmethod
+    def largest_cc_cluster(
+        img: np.ndarray,
+        eps_px: int,
+        invert_input: bool,
+        ignore_border: bool,
+        connectivity: int,
+    ) -> OperationResult:
+        """
+        DBSCAN-like clustering for black connected components (holes/speckles) inside a white foreground.
+        Keep the cluster whose members have the largest **summed area**, and fill other black components
+        to white.
+
+        eps_px: centroid distance threshold (pixels).
+        """
+        if img is None:
+            raise ValueError("No image.")
+
+        gray = ensure_gray(img)
+        _, bin_img = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+
+        if invert_input:
+            bin_img = 255 - bin_img
+
+        h, w = bin_img.shape[:2]
+        if h <= 0 or w <= 0:
+            return OperationResult(
+                ensure_bgr(bin_img), "Largest CC Cluster (empty image)"
+            )
+
+        inv = 255 - bin_img
+        n, labels, stats, centroids = cv2.connectedComponentsWithStats(
+            inv, connectivity=connectivity
+        )
+        if n <= 1:
+            out_bin = bin_img.copy()
+            if invert_input:
+                out_bin = 255 - out_bin
+            return OperationResult(
+                ensure_bgr(out_bin), f"Largest CC Cluster (eps={eps_px}px, no CC)"
+            )
+
+        border_touch = [False] * n
+        if ignore_border:
+            top = labels[0, :]
+            bot = labels[h - 1, :]
+            left = labels[:, 0]
+            right = labels[:, w - 1]
+            touched = np.unique(
+                np.concatenate([top, bot, left, right]).astype(np.int32)
+            )
+            for idx in touched.tolist():
+                if 0 <= idx < n:
+                    border_touch[idx] = True
+
+        cand_labels = []
+        cand_pts = []
+        cand_areas = []
+        for lab in range(1, n):
+            if ignore_border and border_touch[lab]:
+                continue
+            area = int(stats[lab, cv2.CC_STAT_AREA])
+            cx, cy = centroids[lab]
+            cand_labels.append(lab)
+            cand_pts.append((float(cx), float(cy)))
+            cand_areas.append(area)
+
+        if len(cand_labels) <= 1:
+            out_bin = bin_img.copy()
+            if invert_input:
+                out_bin = 255 - out_bin
+            return OperationResult(
+                ensure_bgr(out_bin),
+                f"Largest CC Cluster (eps={eps_px}px, candidates<=1)",
+            )
+
+        eps = max(1, int(eps_px))
+        eps2 = float(eps * eps)
+        k = len(cand_labels)
+
+        adj = [[] for _ in range(k)]
+        for i in range(k):
+            xi, yi = cand_pts[i]
+            for j in range(i + 1, k):
+                xj, yj = cand_pts[j]
+                dx = xi - xj
+                dy = yi - yj
+                if (dx * dx + dy * dy) <= eps2:
+                    adj[i].append(j)
+                    adj[j].append(i)
+
+        visited = [False] * k
+        best_members = None
+        best_area_sum = -1
+        for i in range(k):
+            if visited[i]:
+                continue
+            stack = [i]
+            visited[i] = True
+            members = []
+            area_sum = 0
+            while stack:
+                u = stack.pop()
+                members.append(u)
+                area_sum += int(cand_areas[u])
+                for v in adj[u]:
+                    if not visited[v]:
+                        visited[v] = True
+                        stack.append(v)
+            if area_sum > best_area_sum:
+                best_area_sum = area_sum
+                best_members = members
+
+        keep_labels = (
+            set(cand_labels[i] for i in best_members) if best_members else set()
+        )
+
+        out_bin = bin_img.copy()
+        for lab in cand_labels:
+            if lab not in keep_labels:
+                out_bin[labels == lab] = 255
+
+        if invert_input:
+            out_bin = 255 - out_bin
+
+        return OperationResult(
+            ensure_bgr(out_bin),
+            f"Largest CC Cluster (eps={eps}px, conn={connectivity}, invert={invert_input}, ignore_border={ignore_border})",
+        )
+
+    @staticmethod
     def clahe(img: np.ndarray, clip_limit: float, tile: int) -> OperationResult:
         gray = ensure_gray(img)
         clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(tile, tile))
@@ -377,9 +623,7 @@ class Processor:
     def unsharp_mask(
         img: np.ndarray, k: int, sigma: float, amount: float
     ) -> OperationResult:
-        # amount: 0..3
         blur = cv2.GaussianBlur(img, (k, k), sigmaX=sigma, sigmaY=sigma)
-        # sharpen = img*(1+amount) - blur*amount
         out = cv2.addWeighted(img, 1.0 + amount, blur, -amount, 0)
         out = np.clip(out, 0, 255).astype(np.uint8)
         return OperationResult(
@@ -388,7 +632,6 @@ class Processor:
 
     @staticmethod
     def gamma_correction(img: np.ndarray, gamma: float) -> OperationResult:
-        # gamma > 0
         inv = 1.0 / max(gamma, 1e-6)
         table = np.array([((i / 255.0) ** inv) * 255.0 for i in range(256)]).astype(
             np.uint8
@@ -436,20 +679,34 @@ class ImageLabel(QLabel):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Image Pipeline Designer")
-        self.resize(1400, 800)
+        self.setWindowTitle("Image Pipeline Designer (PyQt5 + OpenCV)")
+        self.resize(1600, 850)
 
         # Data model
         self.original_image: Optional[np.ndarray] = None
-        self.states: List[np.ndarray] = []
-        self.history_steps: List[str] = []
-        self.state_index: int = -1
+        self.states: List[np.ndarray] = (
+            []
+        )  # cached images for each step (len = steps+1)
+        self.history_steps: List[str] = []  # step descriptions (len = steps)
+        self.pipeline_ops: List[Dict[str, Any]] = (
+            []
+        )  # replayable steps: [{"op": str, "params": dict}, ...]
+        self.state_index: int = -1  # current committed state index (0..len(states)-1)
         self.preview_image: Optional[np.ndarray] = None
         self.current_operation: str = "Average Blur"
 
-        # For Difference operation
+        # For Difference operation (UI convenience)
         self.diff_image_raw: Optional[np.ndarray] = None
         self.diff_image_path: str = ""
+        self.diff_folder: str = ""
+        self.diff_folder_images: List[str] = []
+        self.diff_folder_index: int = -1
+
+        # Folder navigation state
+        self.current_image_path: str = ""
+        self.current_folder: str = ""
+        self.current_folder_images: List[str] = []
+        self.current_folder_index: int = -1
 
         # Debounce preview updates
         self.preview_timer = QTimer(self)
@@ -468,10 +725,12 @@ class MainWindow(QMainWindow):
         img_group = QGroupBox("Main Panel")
         img_grid = QGridLayout(img_group)
 
-        self.before_label = ImageLabel("Before")
-        self.after_label = ImageLabel("After")
-        img_grid.addWidget(self.before_label, 0, 0)
-        img_grid.addWidget(self.after_label, 0, 1)
+        self.orig_label = ImageLabel("Original")  # NEW pane
+        self.before_label = ImageLabel("Current")
+        self.after_label = ImageLabel("Preview")
+        img_grid.addWidget(self.orig_label, 0, 0)
+        img_grid.addWidget(self.before_label, 0, 1)
+        img_grid.addWidget(self.after_label, 0, 2)
 
         left_layout.addWidget(img_group, stretch=6)
 
@@ -491,22 +750,91 @@ class MainWindow(QMainWindow):
 
         func_group = QGroupBox("Function Panel")
         func_layout = QVBoxLayout(func_group)
+        func_layout.setSpacing(10)
 
+        # --- Source / pipeline ---
         self.btn_load = QPushButton("Load Image")
+        self.btn_load.setToolTip("Load an image and clear all history.")
+        self.btn_apply_new = QPushButton("Apply Pipeline to New Image")
+        self.btn_apply_new.setToolTip(
+            "Pick another image and re-apply current pipeline."
+        )
+
+        # --- Actions ---
         self.btn_apply = QPushButton("Apply Step")
+        self.btn_apply.setToolTip("Commit current preview as a pipeline step.")
+        self.btn_save = QPushButton("Save Result")
+        self.btn_save.setToolTip("Save current result image to disk.")
+
+        # --- Folder navigator ---
+        self.btn_prev = QPushButton("◀")
+        self.btn_next = QPushButton("▶")
+        for _b in (self.btn_prev, self.btn_next):
+            _b.setFixedWidth(44)
+            _b.setMinimumHeight(36)
+
+        self.btn_prev.setToolTip("Previous image in this folder")
+        self.btn_next.setToolTip("Next image in this folder")
+
+        self.nav_label = QLabel("No folder")
+        self.nav_label.setAlignment(Qt.AlignCenter)
+        self.nav_label.setWordWrap(True)
+        self.nav_label.setMinimumHeight(36)
+
+        # --- History controls ---
         self.btn_undo = QPushButton("Undo")
         self.btn_redo = QPushButton("Redo")
         self.btn_reset = QPushButton("Reset")
+        self.btn_reset.setToolTip("Reset to the original image and clear all history.")
 
-        func_layout.addWidget(self.btn_load)
-        func_layout.addWidget(self.btn_apply)
+        for _b in (
+            self.btn_load,
+            self.btn_apply_new,
+            self.btn_apply,
+            self.btn_save,
+            self.btn_undo,
+            self.btn_redo,
+            self.btn_reset,
+        ):
+            _b.setMinimumHeight(36)
 
-        row2 = QHBoxLayout()
-        row2.addWidget(self.btn_undo)
-        row2.addWidget(self.btn_redo)
-        func_layout.addLayout(row2)
+        # Row: load + apply pipeline to new image
+        src_row = QHBoxLayout()
+        src_row.addWidget(self.btn_load, 1)
+        src_row.addWidget(self.btn_apply_new, 1)
+        func_layout.addLayout(src_row)
+
+        sep1 = QFrame()
+        sep1.setFrameShape(QFrame.HLine)
+        sep1.setFrameShadow(QFrame.Sunken)
+        func_layout.addWidget(sep1)
+
+        # Row: navigator (◀ [index/name] ▶)
+        nav_row = QHBoxLayout()
+        nav_row.addWidget(self.btn_prev)
+        nav_row.addWidget(self.nav_label, 1)
+        nav_row.addWidget(self.btn_next)
+        func_layout.addLayout(nav_row)
+
+        sep2 = QFrame()
+        sep2.setFrameShape(QFrame.HLine)
+        sep2.setFrameShadow(QFrame.Sunken)
+        func_layout.addWidget(sep2)
+
+        # Row: apply + save
+        act_row = QHBoxLayout()
+        act_row.addWidget(self.btn_apply, 1)
+        act_row.addWidget(self.btn_save, 1)
+        func_layout.addLayout(act_row)
+
+        # Row: undo + redo
+        hist_row = QHBoxLayout()
+        hist_row.addWidget(self.btn_undo, 1)
+        hist_row.addWidget(self.btn_redo, 1)
+        func_layout.addLayout(hist_row)
 
         func_layout.addWidget(self.btn_reset)
+
         right_layout.addWidget(func_group)
 
         op_group = QGroupBox("Image Operation Panel")
@@ -525,6 +853,8 @@ class MainWindow(QMainWindow):
                 "Canny",
                 "Morphology",
                 "Difference",
+                "CC Area Filter",
+                "Largest CC Cluster",
                 "CLAHE",
                 "Unsharp Mask",
                 "Gamma",
@@ -533,7 +863,7 @@ class MainWindow(QMainWindow):
         op_layout.addWidget(QLabel("Operation"))
         op_layout.addWidget(self.op_selector)
 
-        # Parameters: use QStackedWidget
+        # Parameters: QStackedWidget
         self.param_group = QGroupBox("Parameters")
         self.param_stack = QStackedWidget()
         pg_layout = QVBoxLayout(self.param_group)
@@ -553,8 +883,13 @@ class MainWindow(QMainWindow):
         self._connect_param_signals()
 
         # Wire events
-        self.btn_load.clicked.connect(self.load_image)
+        self.btn_load.clicked.connect(self.load_image_with_warning)
+        self.btn_apply_new.clicked.connect(self.apply_pipeline_to_new_image)
         self.btn_apply.clicked.connect(self.apply_step)
+        self.btn_save.clicked.connect(self.save_result_image)
+        self.btn_prev.clicked.connect(self.navigate_prev)
+        self.btn_next.clicked.connect(self.navigate_next)
+
         self.btn_undo.clicked.connect(self.undo)
         self.btn_redo.clicked.connect(self.redo)
         self.btn_reset.clicked.connect(self.reset)
@@ -563,6 +898,20 @@ class MainWindow(QMainWindow):
         self.on_operation_changed(self.op_selector.currentText())
         self.set_controls_enabled(False)
         self.refresh_history()
+        self._update_nav_buttons()
+
+    # ----------------------------
+    # Keyboard navigation
+    # ----------------------------
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Left:
+            self.navigate_prev()
+            return
+        if event.key() == Qt.Key_Right:
+            self.navigate_next()
+            return
+        super().keyPressEvent(event)
 
     # ----------------------------
     # Parameter pages
@@ -609,7 +958,7 @@ class MainWindow(QMainWindow):
         self.params["Median Blur"].update({"m_k": m_k})
         self._add_param_page("Median Blur", w)
 
-        # Threshold (NEW)
+        # Threshold
         self.params["Threshold"] = {}
         w = QWidget()
         l = QVBoxLayout(w)
@@ -735,6 +1084,81 @@ class MainWindow(QMainWindow):
         )
         self._add_param_page("Difference", w)
 
+        # CC Area Filter (pixel-based)
+        self.params["CC Area Filter"] = {}
+        w = QWidget()
+        l = QVBoxLayout(w)
+
+        cc_thr_px = QSpinBox()
+        cc_thr_px.setMinimum(0)
+        cc_thr_px.setMaximum(999999999)  # will be updated to H*W after loading image
+        cc_thr_px.setValue(200)
+        cc_thr_px.setSingleStep(10)
+
+        cc_mode = QComboBox()
+        cc_mode.addItems(["Remove Larger Than", "Remove Smaller Than"])
+        cc_conn = QComboBox()
+        cc_conn.addItems(["8", "4"])
+        cc_inv = QCheckBox("Invert Input Binary")
+        cc_ignore_border = QCheckBox("Ignore Border Components")
+        cc_ignore_border.setChecked(True)
+
+        l.addWidget(QLabel("Area Threshold (px)"))
+        l.addWidget(cc_thr_px)
+        l.addWidget(QLabel("Mode"))
+        l.addWidget(cc_mode)
+        l.addWidget(QLabel("Connectivity"))
+        l.addWidget(cc_conn)
+        l.addWidget(cc_inv)
+        l.addWidget(cc_ignore_border)
+        l.addStretch(1)
+
+        self.params["CC Area Filter"].update(
+            {
+                "cc_thr_px": cc_thr_px,
+                "cc_mode": cc_mode,
+                "cc_conn": cc_conn,
+                "cc_inv": cc_inv,
+                "cc_ignore_border": cc_ignore_border,
+            }
+        )
+        self._add_param_page("CC Area Filter", w)
+
+        # Largest CC Cluster
+        self.params["Largest CC Cluster"] = {}
+        w = QWidget()
+        l = QVBoxLayout(w)
+
+        lcc_eps = QSpinBox()
+        lcc_eps.setMinimum(1)
+        lcc_eps.setMaximum(999999999)  # updated to max(H, W) after loading image
+        lcc_eps.setValue(40)
+        lcc_eps.setSingleStep(5)
+
+        lcc_conn = QComboBox()
+        lcc_conn.addItems(["8", "4"])
+        lcc_inv = QCheckBox("Invert Input Binary")
+        lcc_ignore_border = QCheckBox("Ignore Border Components")
+        lcc_ignore_border.setChecked(True)
+
+        l.addWidget(QLabel("Cluster Radius (px)"))
+        l.addWidget(lcc_eps)
+        l.addWidget(QLabel("Connectivity"))
+        l.addWidget(lcc_conn)
+        l.addWidget(lcc_inv)
+        l.addWidget(lcc_ignore_border)
+        l.addStretch(1)
+
+        self.params["Largest CC Cluster"].update(
+            {
+                "lcc_eps": lcc_eps,
+                "lcc_conn": lcc_conn,
+                "lcc_inv": lcc_inv,
+                "lcc_ignore_border": lcc_ignore_border,
+            }
+        )
+        self._add_param_page("Largest CC Cluster", w)
+
         # CLAHE
         self.params["CLAHE"] = {}
         w = QWidget()
@@ -755,7 +1179,6 @@ class MainWindow(QMainWindow):
         l = QVBoxLayout(w)
         us_k = OddSlider("Kernel Size", odd_1_31, 5)
         us_sigma = FloatSlider("Sigma", 0.0, 10.0, 1.0, scale=10)
-        # amount 0..3.0
         us_amount = FloatSlider("Amount", 0.0, 3.0, 1.0, scale=100)
         l.addWidget(us_k)
         l.addWidget(us_sigma)
@@ -770,14 +1193,13 @@ class MainWindow(QMainWindow):
         self.params["Gamma"] = {}
         w = QWidget()
         l = QVBoxLayout(w)
-        # gamma 0.1..3.0
         gamma = FloatSlider("Gamma", 0.10, 3.00, 1.00, scale=100)
         l.addWidget(gamma)
         l.addStretch(1)
         self.params["Gamma"].update({"gamma": gamma})
         self._add_param_page("Gamma", w)
 
-        # Hook Difference button here (needs access to self)
+        # Hook Difference button (needs self)
         self.params["Difference"]["diff_btn"].clicked.connect(
             self.load_difference_image
         )
@@ -794,12 +1216,13 @@ class MainWindow(QMainWindow):
                 widget.currentIndexChanged.connect(self.schedule_preview_update)
             elif isinstance(widget, QCheckBox):
                 widget.stateChanged.connect(self.schedule_preview_update)
+            elif isinstance(widget, QSpinBox):
+                widget.valueChanged.connect(self.schedule_preview_update)
 
         for op_name, pack in self.params.items():
             for k, v in pack.items():
                 if k == "page":
                     continue
-                # Difference button handled separately; QLabel no need
                 if op_name == "Difference" and k in ("diff_btn", "diff_path"):
                     continue
                 hook(v)
@@ -809,23 +1232,102 @@ class MainWindow(QMainWindow):
     # ----------------------------
 
     def set_controls_enabled(self, enabled: bool):
+        self.btn_apply_new.setEnabled(enabled)
         self.btn_apply.setEnabled(enabled)
+        self.btn_save.setEnabled(enabled)
+        self.btn_prev.setEnabled(enabled)
+        self.btn_next.setEnabled(enabled)
         self.btn_undo.setEnabled(enabled)
         self.btn_redo.setEnabled(enabled)
         self.btn_reset.setEnabled(enabled)
         self.op_selector.setEnabled(enabled)
         self.param_group.setEnabled(enabled)
 
+    def _update_nav_buttons(self):
+        has_list = (
+            len(self.current_folder_images) >= 2 and self.current_folder_index >= 0
+        )
+        self.btn_prev.setEnabled(has_list and self.state_index >= 0)
+        self.btn_next.setEnabled(has_list and self.state_index >= 0)
+
+    def _update_nav_label(self):
+        """Update navigator label: show index/total + filename."""
+        try:
+            if not hasattr(self, "nav_label") or self.nav_label is None:
+                return
+        except Exception:
+            return
+
+        if not self.current_image_path:
+            self.nav_label.setText("No folder")
+            return
+
+        name = os.path.basename(self.current_image_path)
+        if self.current_folder_index >= 0 and len(self.current_folder_images) > 0:
+            self.nav_label.setText(
+                f"{self.current_folder_index + 1}/{len(self.current_folder_images)}\n{name}"
+            )
+        else:
+            self.nav_label.setText(name)
+
+    def _update_lcc_eps_max(self):
+        """Set Largest CC Cluster eps maximum to max(H, W)."""
+        if self.original_image is None:
+            return
+        if "Largest CC Cluster" not in self.params:
+            return
+        sb = self.params["Largest CC Cluster"].get("lcc_eps", None)
+        if sb is None:
+            return
+        h, w = self.original_image.shape[:2]
+        mx = int(max(h, w))
+        try:
+            sb.setMaximum(mx)
+            if sb.value() > mx:
+                sb.setValue(mx)
+        except Exception:
+            pass
+
+    def _update_cc_area_filter_max(self):
+        """Set CC Area Filter threshold maximum to current image H*W (pixel count)."""
+        if self.original_image is None:
+            return
+        if "CC Area Filter" not in self.params:
+            return
+        sb = self.params["CC Area Filter"].get("cc_thr_px", None)
+        if sb is None:
+            return
+        h, w = self.original_image.shape[:2]
+        mx = int(h * w)
+        try:
+            sb.setMaximum(mx)
+            if sb.value() > mx:
+                sb.setValue(mx)
+        except Exception:
+            pass
+
     # ----------------------------
-    # File loading
+    # Load image (reset) with warning
     # ----------------------------
 
-    def load_image(self):
+    def load_image_with_warning(self):
+        # Warn only when there exists at least one history operation
+        if self.pipeline_ops or self.history_steps:
+            reply = QMessageBox.question(
+                self,
+                "Warning",
+                "Load new image will clear all history.\n\nContinue?",
+                QMessageBox.Ok | QMessageBox.Cancel,
+                QMessageBox.Cancel,
+            )
+            if reply != QMessageBox.Ok:
+                return
+
         path, _ = QFileDialog.getOpenFileName(
             self,
             "Open Image",
             "",
-            "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff);;All Files (*)",
+            "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.webp);;All Files (*)",
         )
         if not path:
             return
@@ -835,23 +1337,137 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Error", "Failed to load image.")
             return
 
+        # Reset everything
         self.original_image = img
         self.states = [img.copy()]
         self.history_steps = []
+        self.pipeline_ops = []
         self.state_index = 0
         self.preview_image = img.copy()
 
-        # reset difference state (new base image -> new reference makes sense)
+        # reset difference state
         self.diff_image_raw = None
         self.diff_image_path = ""
         self.params["Difference"]["diff_path"].setText("(No second image)")
 
+        self._set_current_file(path)
+
+        self.orig_label.set_cv_image(self.original_image)
+        self._update_cc_area_filter_max()
+        self._update_lcc_eps_max()
         self.before_label.set_cv_image(self.states[self.state_index])
         self.after_label.set_cv_image(self.preview_image)
 
         self.set_controls_enabled(True)
         self.refresh_history()
         self.schedule_preview_update()
+        self._update_nav_buttons()
+
+    # ----------------------------
+    # Difference reference
+    # ----------------------------
+
+    def _is_difference_in_pipeline(self) -> bool:
+        return any(step.get("op") == "Difference" for step in (self.pipeline_ops or []))
+
+    def _set_difference_reference(
+        self,
+        path: str,
+        *,
+        update_pipeline: bool = True,
+        schedule_preview: bool = True,
+    ):
+        """Set/remember the difference reference image path, build folder state, and optionally update pipeline."""
+        if not path:
+            return
+
+        img2 = read_image_any_path(path)
+        if img2 is None:
+            raise ValueError("Failed to load second image.")
+
+        self.diff_image_raw = img2
+        self.diff_image_path = path
+
+        # Folder state for auto prev/next syncing
+        self.diff_folder = os.path.dirname(path)
+        self.diff_folder_images = list_images_in_dir(self.diff_folder)
+        try:
+            self.diff_folder_index = self.diff_folder_images.index(path)
+        except ValueError:
+            rp = os.path.realpath(path)
+            idx = -1
+            for i, p in enumerate(self.diff_folder_images):
+                if os.path.realpath(p) == rp:
+                    idx = i
+                    break
+            self.diff_folder_index = idx
+
+        # Update label on Difference param page
+        try:
+            self.params["Difference"]["diff_path"].setText(
+                f"Second: {os.path.basename(path)}"
+            )
+        except Exception:
+            pass
+
+        # Keep pipeline Difference steps in sync (so replay uses the current reference)
+        if update_pipeline and self.pipeline_ops:
+            for step in self.pipeline_ops:
+                if step.get("op") == "Difference":
+                    step.setdefault("params", {})
+                    step["params"]["path"] = path
+
+        if schedule_preview:
+            self.schedule_preview_update()
+
+    def _prompt_difference_reference(self) -> bool:
+        """Ask user to choose a new difference reference image."""
+        start_dir = ""
+        if self.diff_image_path:
+            start_dir = os.path.dirname(self.diff_image_path)
+        elif self.current_folder:
+            start_dir = self.current_folder
+
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open Difference Reference Image",
+            start_dir,
+            "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.webp);;All Files (*)",
+        )
+        if not path:
+            return False
+
+        self._set_difference_reference(
+            path, update_pipeline=True, schedule_preview=False
+        )
+        return True
+
+    def _advance_difference_reference(self, delta: int):
+        """When navigating base images (Prev/Next), also move the difference reference image within its own folder."""
+        if not self._is_difference_in_pipeline():
+            return
+        if not self.diff_image_path:
+            return
+
+        # Ensure folder state exists
+        if not self.diff_folder_images:
+            self.diff_folder = os.path.dirname(self.diff_image_path)
+            self.diff_folder_images = list_images_in_dir(self.diff_folder)
+            try:
+                self.diff_folder_index = self.diff_folder_images.index(
+                    self.diff_image_path
+                )
+            except ValueError:
+                self.diff_folder_index = -1
+
+        if self.diff_folder_index < 0 or len(self.diff_folder_images) < 2:
+            return
+
+        new_idx = (self.diff_folder_index + int(delta)) % len(self.diff_folder_images)
+        new_path = self.diff_folder_images[new_idx]
+        self._set_difference_reference(
+            new_path, update_pipeline=True, schedule_preview=False
+        )
 
     def load_difference_image(self):
         if self.state_index < 0 or not self.states:
@@ -860,27 +1476,82 @@ class MainWindow(QMainWindow):
 
         path, _ = QFileDialog.getOpenFileName(
             self,
-            "Open Second Image",
-            "",
-            "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff);;All Files (*)",
+            "Open Difference Reference Image",
+            self.current_folder if self.current_folder else "",
+            "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.webp);;All Files (*)",
         )
         if not path:
             return
 
-        img2 = read_image_any_path(path)
-        if img2 is None:
-            QMessageBox.critical(self, "Error", "Failed to load second image.")
+        try:
+            self._set_difference_reference(
+                path, update_pipeline=True, schedule_preview=True
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to load second image.\n\n{e}")
             return
 
-        self.diff_image_raw = img2
-        self.diff_image_path = path
-        base_name = os.path.basename(path)
-        self.params["Difference"]["diff_path"].setText(f"Second: {base_name}")
-        self.schedule_preview_update()
+    def save_result_image(self):
+        if self.state_index < 0 or not self.states:
+            QMessageBox.information(self, "Info", "No result image to save.")
+            return
+
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Result Image",
+            "",
+            "PNG (*.png);;JPEG (*.jpg *.jpeg);;BMP (*.bmp);;TIFF (*.tif *.tiff);;WEBP (*.webp)",
+        )
+        if not path:
+            return
+
+        try:
+            img = self.states[self.state_index]
+            write_image_any_path(path, img)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to save image.\n\n{e}")
 
     # ----------------------------
-    # Operation selection & preview
+    # Folder navigation
     # ----------------------------
+
+    def _set_current_file(self, path: str):
+        self.current_image_path = path
+        self.current_folder = os.path.dirname(path)
+        self.current_folder_images = list_images_in_dir(self.current_folder)
+        try:
+            self.current_folder_index = self.current_folder_images.index(path)
+        except ValueError:
+            # maybe path differs by case/realpath
+            rp = os.path.realpath(path)
+            idx = -1
+            for i, p in enumerate(self.current_folder_images):
+                if os.path.realpath(p) == rp:
+                    idx = i
+                    break
+            self.current_folder_index = idx
+        self._update_nav_label()
+        self._update_nav_buttons()
+
+    def navigate_prev(self):
+        if self.current_folder_index < 0 or len(self.current_folder_images) < 2:
+            return
+        new_idx = (self.current_folder_index - 1) % len(self.current_folder_images)
+
+        # Sync difference reference navigation, if needed
+        self._advance_difference_reference(-1)
+
+        self._load_image_keep_pipeline(self.current_folder_images[new_idx])
+
+    def navigate_next(self):
+        if self.current_folder_index < 0 or len(self.current_folder_images) < 2:
+            return
+        new_idx = (self.current_folder_index + 1) % len(self.current_folder_images)
+
+        # Sync difference reference navigation, if needed
+        self._advance_difference_reference(+1)
+
+        self._load_image_keep_pipeline(self.current_folder_images[new_idx])
 
     def on_operation_changed(self, op_name: str):
         self.current_operation = op_name
@@ -959,14 +1630,21 @@ class MainWindow(QMainWindow):
             return Processor.morphology(base, mop, shape, k, iters)
 
         if op == "Difference":
+            if self.diff_image_raw is None and self.diff_image_path:
+                maybe = read_image_any_path(self.diff_image_path)
+                if maybe is not None:
+                    self.diff_image_raw = maybe
+                    self.params["Difference"]["diff_path"].setText(
+                        f"Second: {os.path.basename(self.diff_image_path)}"
+                    )
+
             if self.diff_image_raw is None:
                 raise ValueError("Difference: please click 'Load Second Image' first.")
-            ref = self.diff_image_raw
-            ref = resize_to_match(ref, base)
+
+            ref = resize_to_match(self.diff_image_raw, base)
             use_abs = self.params[op]["diff_abs"].isChecked()
             normalize = self.params[op]["diff_norm"].isChecked()
             res = Processor.absdiff(base, ref, use_abs=use_abs, normalize=normalize)
-            # enrich description with file name (nice for history)
             name = (
                 os.path.basename(self.diff_image_path)
                 if self.diff_image_path
@@ -974,6 +1652,34 @@ class MainWindow(QMainWindow):
             )
             res.description = f"{res.description} (ref={name})"
             return res
+
+        if op == "CC Area Filter":
+            area_thresh_px = int(self.params[op]["cc_thr_px"].value())
+            mode = self.params[op]["cc_mode"].currentText()
+            connectivity = int(self.params[op]["cc_conn"].currentText())
+            inv = self.params[op]["cc_inv"].isChecked()
+            ignore_border = self.params[op]["cc_ignore_border"].isChecked()
+            return Processor.cc_area_filter(
+                base,
+                area_thresh_px=area_thresh_px,
+                mode=mode,
+                invert_input=inv,
+                ignore_border=ignore_border,
+                connectivity=connectivity,
+            )
+
+        if op == "Largest CC Cluster":
+            eps_px = int(self.params[op]["lcc_eps"].value())
+            connectivity = int(self.params[op]["lcc_conn"].currentText())
+            inv = self.params[op]["lcc_inv"].isChecked()
+            ignore_border = self.params[op]["lcc_ignore_border"].isChecked()
+            return Processor.largest_cc_cluster(
+                base,
+                eps_px=eps_px,
+                invert_input=inv,
+                ignore_border=ignore_border,
+                connectivity=connectivity,
+            )
 
         if op == "CLAHE":
             clip = self.params[op]["clahe_clip"].value()
@@ -993,8 +1699,259 @@ class MainWindow(QMainWindow):
         raise ValueError(f"Unknown operation: {op}")
 
     # ----------------------------
-    # Pipeline actions
+    # Pipeline replay (for new input)
     # ----------------------------
+
+    def _collect_current_params(self, op: str) -> Dict[str, Any]:
+        p = self.params[op]
+
+        if op == "Average Blur":
+            return {"k": p["avg_k"].value()}
+
+        if op == "Gaussian Blur":
+            return {"k": p["g_k"].value(), "sigma": p["g_sigma"].value()}
+
+        if op == "Median Blur":
+            return {"k": p["m_k"].value()}
+
+        if op == "Threshold":
+            return {"t": p["t_val"].value(), "invert": p["t_inv"].isChecked()}
+
+        if op == "Adaptive Threshold":
+            return {
+                "block": p["at_block"].value(),
+                "C": p["at_C"].value(),
+                "method": p["at_method"].currentText(),
+            }
+
+        if op == "Otsu Threshold":
+            return {"invert": p["otsu_inv"].isChecked()}
+
+        if op == "Sobel":
+            return {
+                "ksize": int(p["s_ksize"].currentText()),
+                "mode": p["s_mode"].currentText(),
+            }
+
+        if op == "Canny":
+            return {
+                "t1": p["c_t1"].value(),
+                "t2": p["c_t2"].value(),
+                "aperture": int(p["c_ap"].currentText()),
+                "l2": p["c_l2"].isChecked(),
+            }
+
+        if op == "Morphology":
+            return {
+                "op": p["mo_op"].currentText(),
+                "shape": p["mo_shape"].currentText(),
+                "k": p["mo_k"].value(),
+                "iters": p["mo_it"].value(),
+            }
+
+        if op == "Difference":
+            return {
+                "use_abs": p["diff_abs"].isChecked(),
+                "normalize": p["diff_norm"].isChecked(),
+                "path": self.diff_image_path,
+            }
+
+        if op == "CC Area Filter":
+            return {
+                "area_thresh_px": int(p["cc_thr_px"].value()),
+                "mode": p["cc_mode"].currentText(),
+                "connectivity": int(p["cc_conn"].currentText()),
+                "invert_input": p["cc_inv"].isChecked(),
+                "ignore_border": p["cc_ignore_border"].isChecked(),
+            }
+
+        if op == "Largest CC Cluster":
+            return {
+                "eps_px": int(p["lcc_eps"].value()),
+                "connectivity": int(p["lcc_conn"].currentText()),
+                "invert_input": p["lcc_inv"].isChecked(),
+                "ignore_border": p["lcc_ignore_border"].isChecked(),
+            }
+
+        if op == "CLAHE":
+            return {"clip": p["clahe_clip"].value(), "tile": p["clahe_tile"].value()}
+
+        if op == "Unsharp Mask":
+            return {
+                "k": p["us_k"].value(),
+                "sigma": p["us_sigma"].value(),
+                "amount": p["us_amount"].value(),
+            }
+
+        if op == "Gamma":
+            return {"gamma": p["gamma"].value()}
+
+        return {}
+
+    def _run_operation_with_params(
+        self, op: str, base: np.ndarray, params: Dict[str, Any]
+    ) -> OperationResult:
+        if op == "Average Blur":
+            return Processor.avg_blur(base, params["k"])
+
+        if op == "Gaussian Blur":
+            return Processor.gaussian_blur(base, params["k"], params["sigma"])
+
+        if op == "Median Blur":
+            return Processor.median_blur(base, params["k"])
+
+        if op == "Threshold":
+            return Processor.threshold(base, params["t"], params["invert"])
+
+        if op == "Adaptive Threshold":
+            return Processor.adaptive_threshold(
+                base, params["block"], params["C"], params["method"]
+            )
+
+        if op == "Otsu Threshold":
+            return Processor.otsu_threshold(base, params["invert"])
+
+        if op == "Sobel":
+            return Processor.sobel(base, params["ksize"], params["mode"])
+
+        if op == "Canny":
+            return Processor.canny(
+                base, params["t1"], params["t2"], params["aperture"], params["l2"]
+            )
+
+        if op == "Morphology":
+            return Processor.morphology(
+                base, params["op"], params["shape"], params["k"], params["iters"]
+            )
+
+        if op == "Difference":
+            ref_path = params.get("path", "")
+            if not ref_path:
+                raise ValueError("Difference step requires a reference image path.")
+            ref = read_image_any_path(ref_path)
+            if ref is None:
+                raise ValueError(
+                    f"Failed to load difference reference image: {os.path.basename(ref_path)}"
+                )
+            ref = resize_to_match(ref, base)
+            res = Processor.absdiff(base, ref, params["use_abs"], params["normalize"])
+            res.description = f"{res.description} (ref={os.path.basename(ref_path)})"
+            return res
+
+        if op == "CC Area Filter":
+            return Processor.cc_area_filter(
+                base,
+                area_thresh_px=int(params["area_thresh_px"]),
+                mode=params["mode"],
+                invert_input=bool(params["invert_input"]),
+                ignore_border=bool(params["ignore_border"]),
+                connectivity=int(params["connectivity"]),
+            )
+
+        if op == "Largest CC Cluster":
+            return Processor.largest_cc_cluster(
+                base,
+                eps_px=int(params["eps_px"]),
+                invert_input=bool(params["invert_input"]),
+                ignore_border=bool(params["ignore_border"]),
+                connectivity=int(params["connectivity"]),
+            )
+
+        if op == "CLAHE":
+            return Processor.clahe(base, params["clip"], params["tile"])
+
+        if op == "Unsharp Mask":
+            return Processor.unsharp_mask(
+                base, params["k"], params["sigma"], params["amount"]
+            )
+
+        if op == "Gamma":
+            return Processor.gamma_correction(base, params["gamma"])
+
+        raise ValueError(f"Unknown op: {op}")
+
+    def _recompute_states_for_image(
+        self, img: np.ndarray
+    ) -> Tuple[List[np.ndarray], Optional[str]]:
+        """
+        Recompute cached states by replaying pipeline_ops on img.
+        Returns (states, error_message). error_message is None on success.
+        """
+        states = [img.copy()]
+        try:
+            for step in self.pipeline_ops:
+                op = step["op"]
+                params = step["params"]
+                base = states[-1]
+                result = self._run_operation_with_params(op, base, params)
+                states.append(result.image.copy())
+            return states, None
+        except Exception as e:
+            return [], str(e)
+
+    def _load_image_keep_pipeline(self, path: str):
+        img = read_image_any_path(path)
+        if img is None:
+            QMessageBox.critical(self, "Error", "Failed to load image.")
+            return
+
+        self._set_current_file(path)
+
+        self.original_image = img
+        self.orig_label.set_cv_image(self.original_image)
+        self._update_cc_area_filter_max()
+        self._update_lcc_eps_max()
+        if self.pipeline_ops:
+            states, err = self._recompute_states_for_image(img)
+            if err is not None:
+                QMessageBox.critical(
+                    self, "Error", f"Failed to apply pipeline to new image.\n\n{err}"
+                )
+                return
+            self.states = states
+            self.state_index = len(self.states) - 1
+        else:
+            # No pipeline: behave like a simple load, but without clearing anything else (there's nothing to clear)
+            self.states = [img.copy()]
+            self.state_index = 0
+            self.history_steps = []
+            self.pipeline_ops = []
+
+        cur = self.states[self.state_index]
+        self.before_label.set_cv_image(cur)
+
+        self.preview_image = cur.copy()
+        self.after_label.set_cv_image(self.preview_image)
+
+        self.set_controls_enabled(True)
+        self.refresh_history()
+        self.schedule_preview_update()
+        self._update_nav_buttons()
+
+    def apply_pipeline_to_new_image(self):
+        if self.state_index < 0:
+            QMessageBox.information(self, "Info", "Please load an image first.")
+            return
+        if not self.pipeline_ops:
+            QMessageBox.information(self, "Info", "No pipeline steps to apply.")
+            return
+
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open New Image (Keep Pipeline)",
+            "",
+            "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.webp);;All Files (*)",
+        )
+        if not path:
+            return
+
+        # If pipeline contains Difference, let user pick a new reference image for this new base image
+        if self._is_difference_in_pipeline():
+            ok = self._prompt_difference_reference()
+            if not ok:
+                return
+
+        self._load_image_keep_pipeline(path)
 
     def apply_step(self):
         if self.state_index < 0 or self.preview_image is None:
@@ -1013,9 +1970,17 @@ class MainWindow(QMainWindow):
         if self.state_index < len(self.states) - 1:
             self.states = self.states[: self.state_index + 1]
             self.history_steps = self.history_steps[: self.state_index]
+            self.pipeline_ops = self.pipeline_ops[: self.state_index]
 
+        # Commit
         self.states.append(result.image.copy())
         self.history_steps.append(result.description)
+        self.pipeline_ops.append(
+            {
+                "op": self.current_operation,
+                "params": self._collect_current_params(self.current_operation),
+            }
+        )
         self.state_index += 1
 
         self.before_label.set_cv_image(self.states[self.state_index])
@@ -1052,14 +2017,23 @@ class MainWindow(QMainWindow):
     def reset(self):
         if self.original_image is None:
             return
+        self._update_cc_area_filter_max()
+        self._update_lcc_eps_max()
         self.states = [self.original_image.copy()]
         self.history_steps = []
+        self.pipeline_ops = []
         self.state_index = 0
         self.preview_image = self.states[0].copy()
+
         self.before_label.set_cv_image(self.states[0])
         self.after_label.set_cv_image(self.preview_image)
         self.refresh_history()
         self.schedule_preview_update()
+
+        # reset difference state
+        self.diff_image_raw = None
+        self.diff_image_path = ""
+        self.params["Difference"]["diff_path"].setText("(No second image)")
 
     # ----------------------------
     # History
@@ -1071,9 +2045,16 @@ class MainWindow(QMainWindow):
             return
 
         steps_to_show = self.history_steps[: self.state_index]
-        lines = ["0) Original"]
+        lines = []
+
+        if self.current_image_path:
+            lines.append(f"File: {os.path.basename(self.current_image_path)}")
+            lines.append("")
+
+        lines.append("0) Original")
         for i, s in enumerate(steps_to_show, start=1):
             lines.append(f"{i}) {s}")
+
         lines.append("")
         lines.append(f"Current index: {self.state_index} / {len(self.states) - 1}")
         self.history_text.setPlainText("\n".join(lines))
